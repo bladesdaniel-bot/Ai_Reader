@@ -1,0 +1,9 @@
+# Ignore the compilation folder (this saves you gigabytes of space)
+/target/
+
+# Ignore the heavy local AI model (users can download their own)
+ggml-tiny.en.bin
+
+# Ignore OS files
+.DS_Store
+Thumbs.db

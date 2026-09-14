@@ -1,0 +1,16 @@
+[package]
+name = "ai_reader"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.27" 
+arboard = "3.3"
+tts = "0.26"
+cpal = "0.15"
+whisper-rs = "0.16"
+
+# Add this to force the final executable to be named Ai_Reader.exe
+[[bin]]
+name = "Ai_Reader"
+path = "src/main.rs"
