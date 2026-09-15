@@ -18,13 +18,12 @@ struct VoiceReaderApp {
     clipboard: Clipboard,
     speed: f32,
     alpha: f32,
-
     sentences: Vec<String>,
     current_idx: usize,
     is_playing: bool,
     was_speaking: bool,
     first_frame: bool,
-
+    
     // App Mode & Dictation State
     mode: AppMode,
     dictation_text: String,
@@ -35,8 +34,11 @@ struct VoiceReaderApp {
     audio_buffer: Arc<Mutex<Vec<f32>>>,
     audio_stream: Option<cpal::Stream>,
     
-    // The Whisper AI Brain
-    whisper_ctx: Option<WhisperContext>,
+    // The Whisper AI Brain (now shareable with thread)
+    whisper_ctx: Option<Arc<WhisperContext>>,
+    
+    // Result coming back from the transcription thread
+    transcribe_pending: Arc<Mutex<Option<String>>>,
 }
 
 impl VoiceReaderApp {
@@ -53,12 +55,14 @@ impl VoiceReaderApp {
         }
         let default_rate = tts.normal_rate();
         let _ = tts.set_rate(default_rate);
-
+        
         let whisper_ctx = WhisperContext::new_with_params(
             "ggml-tiny.en.bin",
             WhisperContextParameters::default(),
-        ).ok(); 
-
+        )
+        .ok()
+        .map(Arc::new);
+        
         Self {
             tts,
             clipboard: Clipboard::new().expect("Failed to bind clipboard"),
@@ -71,12 +75,12 @@ impl VoiceReaderApp {
             first_frame: true,
             mode: AppMode::Reader,
             dictation_text: String::new(),
-            
             is_recording: false,
             is_transcribing: false,
             audio_buffer: Arc::new(Mutex::new(Vec::new())),
             audio_stream: None,
             whisper_ctx,
+            transcribe_pending: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -101,14 +105,14 @@ impl VoiceReaderApp {
     fn start_recording(&mut self) {
         self.audio_buffer.lock().unwrap().clear();
         let buffer_clone = self.audio_buffer.clone();
-
+        
         let host = cpal::default_host();
         let device = host.default_input_device().expect("No input device available");
         let config = device.default_input_config().expect("Failed to get default input config");
-
+        
         let sample_rate = config.sample_rate().0 as f32;
         let channels = config.channels() as usize;
-
+        
         let stream = device.build_input_stream(
             &config.into(),
             move |data: &[f32], _: &_| {
@@ -120,14 +124,14 @@ impl VoiceReaderApp {
                     for c in 0..channels {
                         sum += data[(i as usize) * channels + c];
                     }
-                    buffer.push(sum / channels as f32); 
-                    i += ratio; 
+                    buffer.push(sum / channels as f32);
+                    i += ratio;
                 }
             },
             |err| eprintln!("Audio capture error: {}", err),
             None,
         ).expect("Failed to build audio stream");
-
+        
         stream.play().expect("Failed to play audio stream");
         self.audio_stream = Some(stream);
         self.is_recording = true;
@@ -136,61 +140,68 @@ impl VoiceReaderApp {
     fn stop_and_transcribe(&mut self) {
         self.is_recording = false;
         self.is_transcribing = true;
-        self.audio_stream = None; 
-
-        let buffer_clone = self.audio_buffer.clone();
+        self.audio_stream = None;
         
-        if let Some(ctx) = &self.whisper_ctx {
-            let mut state = ctx.create_state().expect("Failed to create Whisper state");
-            
-            let audio_data = {
-                let buffer = buffer_clone.lock().unwrap();
-                buffer.clone()
-            };
-
-            let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-            params.set_language(Some("en"));
-            
-            state.full(params, &audio_data).expect("Transcription failed");
-
-            let mut transcribed = String::new();
-            let num_segments = state.full_n_segments(); 
-            for i in 0..num_segments {
-                if let Some(segment) = state.get_segment(i) {
-                    transcribed.push_str(&segment.to_str_lossy().unwrap());
+        let buffer_clone = self.audio_buffer.clone();
+        let pending = self.transcribe_pending.clone();
+        let ctx_opt = self.whisper_ctx.clone();
+        
+        std::thread::spawn(move || {
+            let result = if let Some(ctx) = ctx_opt {
+                let mut state = ctx.create_state().expect("Failed to create Whisper state");
+                let audio_data = {
+                    let buffer = buffer_clone.lock().unwrap();
+                    buffer.clone()
+                };
+                let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+                params.set_language(Some("en"));
+                
+                if state.full(params, &audio_data).is_ok() {
+                    let mut transcribed = String::new();
+                    let num_segments = state.full_n_segments();
+                    for i in 0..num_segments {
+                        if let Some(segment) = state.get_segment(i) {
+                            transcribed.push_str(&segment.to_str_lossy().unwrap());
+                        }
+                    }
+                    transcribed.trim().to_string()
+                } else {
+                    "Error: transcription failed".to_string()
                 }
-            }
+            } else {
+                "Error: ggml-tiny.en.bin not found!".to_string()
+            };
+            
+            *pending.lock().unwrap() = Some(result);
+        });
+    }
+}
 
-            // NEW LOGIC: Append text instead of overwriting!
-            let clean_text = transcribed.trim();
-            if !clean_text.is_empty() {
-                // If there's already text, add a space before adding the new words
+impl eframe::App for VoiceReaderApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.is_transcribing || self.is_recording || self.is_playing {
+            ctx.request_repaint();
+        }
+
+        // Pick up the result from the background thread (non-blocking)
+        if let Some(new_text) = self.transcribe_pending.lock().unwrap().take() {
+            if new_text.starts_with("Error:") {
+                self.dictation_text = new_text;
+            } else if !new_text.is_empty() {
                 if !self.dictation_text.is_empty() && !self.dictation_text.ends_with(' ') {
                     self.dictation_text.push(' ');
                 }
-                self.dictation_text.push_str(clean_text);
+                self.dictation_text.push_str(&new_text);
             }
-            
-        } else {
-            self.dictation_text = "Error: ggml-tiny.en.bin not found!".to_string();
-        }
-        
-        self.is_transcribing = false;
-    }
-}
-impl eframe::App for VoiceReaderApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        
-        if self.is_transcribing || self.is_recording || self.is_playing {
-            ctx.request_repaint();
+            self.is_transcribing = false;
         }
 
         if self.first_frame {
             if let Some(monitor_size) = ctx.input(|i| i.viewport().monitor_size) {
                 let app_width = 320.0;
                 let app_height = 360.0;
-                let x = monitor_size.x - app_width - 15.0;  
-                let y = monitor_size.y - app_height - 60.0; 
+                let x = monitor_size.x - app_width - 15.0;
+                let y = monitor_size.y - app_height - 60.0;
                 ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x, y)));
                 self.first_frame = false;
             }
@@ -217,12 +228,12 @@ impl eframe::App for VoiceReaderApp {
         visuals.widgets.inactive.rounding = egui::Rounding::same(8.0);
         visuals.widgets.hovered.rounding = egui::Rounding::same(8.0);
         visuals.widgets.active.rounding = egui::Rounding::same(8.0);
-        visuals.slider_trailing_fill = true; 
+        visuals.slider_trailing_fill = true;
         ctx.set_visuals(visuals);
 
         let mut custom_frame = egui::Frame::central_panel(&ctx.style());
         custom_frame.fill = egui::Color32::from_rgba_unmultiplied(27, 27, 27, (self.alpha * 255.0) as u8);
-        custom_frame.rounding = egui::Rounding::same(14.0); 
+        custom_frame.rounding = egui::Rounding::same(14.0);
 
         egui::CentralPanel::default().frame(custom_frame).show(ctx, |ui| {
             
@@ -231,7 +242,7 @@ impl eframe::App for VoiceReaderApp {
                 ui.selectable_value(&mut self.mode, AppMode::Reader, egui::RichText::new("🗣 Reader").strong());
                 ui.selectable_value(&mut self.mode, AppMode::Dictate, egui::RichText::new("🎙 Dictate").strong());
                 
-                let drag_space = ui.available_width() - 65.0; 
+                let drag_space = ui.available_width() - 65.0;
                 let drag_resp = ui.allocate_response(egui::vec2(drag_space, 20.0), egui::Sense::click_and_drag());
                 if drag_resp.is_pointer_button_down_on() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
@@ -247,7 +258,7 @@ impl eframe::App for VoiceReaderApp {
                 });
             });
 
-            ui.add_space(10.0); 
+            ui.add_space(10.0);
 
             if self.mode == AppMode::Reader {
                 
@@ -265,9 +276,9 @@ impl eframe::App for VoiceReaderApp {
                                 self.current_idx = 0;
                                 self.is_playing = true;
                                 self.was_speaking = false;
-                                let _ = self.tts.stop(); 
+                                let _ = self.tts.stop();
                                 if !self.sentences.is_empty() {
-                                    let _ = self.tts.speak(&self.sentences[0], true); 
+                                    let _ = self.tts.speak(&self.sentences[0], true);
                                 }
                             }
                         }
@@ -277,8 +288,8 @@ impl eframe::App for VoiceReaderApp {
                 ui.add_space(10.0);
 
                 ui.horizontal(|ui| {
-                    ui.add_space(10.0); 
-                    let available_width = ui.available_width() - 10.0; 
+                    ui.add_space(10.0);
+                    let available_width = ui.available_width() - 10.0;
                     let spacing = ui.style().spacing.item_spacing.x;
                     let btn_width = (available_width - (spacing * 3.0)) / 4.0;
                     let btn_size = egui::vec2(btn_width, 35.0);
@@ -314,7 +325,7 @@ impl eframe::App for VoiceReaderApp {
                         let _ = self.tts.stop();
                         self.is_playing = false;
                         self.was_speaking = false;
-                        self.current_idx = 0; 
+                        self.current_idx = 0;
                     }
 
                     let ff_btn = egui::Button::new(egui::RichText::new(">>").color(egui::Color32::WHITE).strong())
@@ -340,8 +351,8 @@ impl eframe::App for VoiceReaderApp {
                     let normal_rate = self.tts.normal_rate();
                     let comfortable_max = (normal_rate * 2.5).clamp(min_rate, self.tts.max_rate());
                     ui.scope(|ui| {
-                        ui.set_max_width(220.0); 
-                        ui.style_mut().visuals.selection.bg_fill = egui::Color32::from_rgb(0, 238, 255); 
+                        ui.set_max_width(220.0);
+                        ui.style_mut().visuals.selection.bg_fill = egui::Color32::from_rgb(0, 238, 255);
                         if ui.add(egui::Slider::new(&mut self.speed, min_rate..=comfortable_max)).changed() {
                             let _ = self.tts.set_rate(self.speed);
                         }
@@ -353,7 +364,7 @@ impl eframe::App for VoiceReaderApp {
                     ui.add_space(5.0);
                     ui.scope(|ui| {
                         ui.set_max_width(220.0);
-                        ui.style_mut().visuals.selection.bg_fill = egui::Color32::from_rgb(190, 30, 255); 
+                        ui.style_mut().visuals.selection.bg_fill = egui::Color32::from_rgb(190, 30, 255);
                         ui.add(egui::Slider::new(&mut self.alpha, 0.3..=1.0));
                     });
                 });
@@ -384,7 +395,7 @@ impl eframe::App for VoiceReaderApp {
                     if self.is_recording {
                         let rec_btn = egui::Button::new(
                             egui::RichText::new("■ STOP RECORDING").color(egui::Color32::WHITE).size(18.0).strong()
-                        ).fill(egui::Color32::from_rgb(244, 67, 54)).min_size(button_size); 
+                        ).fill(egui::Color32::from_rgb(244, 67, 54)).min_size(button_size);
                         
                         if ui.add(rec_btn).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                             self.stop_and_transcribe();
@@ -392,12 +403,12 @@ impl eframe::App for VoiceReaderApp {
                     } else if self.is_transcribing {
                         let wait_btn = egui::Button::new(
                             egui::RichText::new("... TRANSCRIBING ...").color(egui::Color32::WHITE).size(18.0).strong()
-                        ).fill(egui::Color32::from_rgb(158, 158, 158)).min_size(button_size); 
+                        ).fill(egui::Color32::from_rgb(158, 158, 158)).min_size(button_size);
                         ui.add(wait_btn);
                     } else {
                         let rec_btn = egui::Button::new(
                             egui::RichText::new("🎙 START DICTATION").color(egui::Color32::WHITE).size(18.0).strong()
-                        ).fill(egui::Color32::from_rgb(233, 30, 99)).min_size(button_size); 
+                        ).fill(egui::Color32::from_rgb(233, 30, 99)).min_size(button_size);
                         
                         if ui.add(rec_btn).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                             self.start_recording();
@@ -408,7 +419,7 @@ impl eframe::App for VoiceReaderApp {
 
                     let copy_btn = egui::Button::new(
                         egui::RichText::new("📋 COPY TO CLIPBOARD").color(egui::Color32::WHITE).size(14.0).strong()
-                    ).fill(egui::Color32::from_rgb(33, 150, 243)).min_size(egui::vec2(ui.available_width() - 20.0, 35.0)); 
+                    ).fill(egui::Color32::from_rgb(33, 150, 243)).min_size(egui::vec2(ui.available_width() - 20.0, 35.0));
                     
                     if ui.add(copy_btn).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                         let _ = self.clipboard.set_text(&self.dictation_text);
@@ -422,7 +433,7 @@ impl eframe::App for VoiceReaderApp {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([320.0, 360.0]) 
+            .with_inner_size([320.0, 360.0])
             .with_always_on_top()
             .with_transparent(true)
             .with_decorations(false),
