@@ -14,3 +14,6 @@ whisper-rs = "0.16"
 [[bin]]
 name = "Ai_Reader"
 path = "src/main.rs"
+
+[build-dependencies]
+winres = "0.1.12"

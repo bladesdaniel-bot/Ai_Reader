@@ -1,0 +1,5 @@
+Ai_Reader/
+├── _internal/             # App dependencies and runtime files
+├── ai_reader.exe          # The main executable
+├── ggml-tiny.en.bin       # The local offline AI speech model
+└── README.md              # Quick start instructions for users
