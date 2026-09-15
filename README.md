@@ -10,9 +10,8 @@ A lightweight, fully offline productivity tool built in Rust. This application c
 
 ## Installation & Usage
 1. Head to the **[Releases](../../releases)** tab on this repository.
-2. Download the latest `ai_reader.exe`.
-3. Download the required `ggml-tiny.en.bin` AI model and place it in the same directory as the executable.
-4. Run `ai_reader.exe` to launch the application.
+2. Download the latest `ai_reader.zip`.
+3. Run `ai_reader.exe` to launch the application.
 
 ## Building from Source
 If you want to compile the project yourself, ensure you have Rust and Cargo installed.
